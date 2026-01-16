@@ -1,393 +1,207 @@
-import argparse
-import json
-import os
-import shutil
-import tempfile
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait
-from pathlib import Path
-from typing import Any, Tuple
+"""
+Data Augmentation Module for Image Processing and Deepfakes.
+Corrected Version: Fix in Salt&Pepper Broadcasting and Execution Order.
+"""
 
+import os
 import cv2
 import numpy as np
-import torch
-import torchaudio
-from librosa.effects import split
-from moviepy import VideoClip, VideoFileClip
-from moviepy.video.compositing.CompositeVideoClip import concatenate_videoclips
-from mtcnn import MTCNN
-from numba import jit
-from numpy.typing import NDArray
-from PIL import Image
-from scipy.io import wavfile
+import argparse
 from tqdm import tqdm
 
+# Define the module's public interface.
+__all__ = [
+    'load_image_to_ndarray',
+    'add_wgn',
+    'add_salt_and_pepper',
+    'add_blur',
+    'gerar_dataset_gaussiano',
+    'gerar_dataset_sal_pimenta',
+    'gerar_dataset_blur'
+]
 
-def init_worker():
-    global detector
-    detector = MTCNN()
+# ==========================================
+# 1. UTILITY FUNCTIONS (IO and Math)
+# ==========================================
 
-
-def check_out_video(
-    index: int,
-    video_path: Path,
-    output_dir: Path,
-):
-    resume_file_path = output_dir.joinpath("resume.json")
-    json_data = None
-    with open(resume_file_path.as_posix()) as f:
-        json_data = json.load(f)
-    json_data["preprocessed_videos"].append(video_path.name)
-    json_data["last_video_index"] = index
-    with open(resume_file_path.as_posix(), "w") as f:
-        json.dump(json_data, f, indent=4)
-
-
-@jit(nopython=True)
-def get_face(frame: NDArray, x1, x2, y1, y2) -> NDArray:
-    return frame[y1:y2, x1:x2]
-
-
-def crop_face(frame: NDArray, detector: MTCNN) -> NDArray | None:
-
-    faces = detector.detect_faces(frame)
-    if faces:
-        result = faces[0]
-        x, y, width, height = result["box"]
-
-        pad_x = int(width * 0.25)
-        pad_y = int(height * 0.25)
-
-        h_frame, w_frame, _ = frame.shape
-        startx = max(0, x - pad_x)
-        starty = max(0, y - pad_y)
-        endx = min(w_frame, x + width + pad_x)
-        endy = min(h_frame, y + height + pad_y)
-        face = get_face(frame, startx, endx, starty, endy)
-
-        return face
+def load_image_to_ndarray(file_path: str) -> np.ndarray:
+    """
+    Loads an image from disk returning an ndarray.
+    Maintains original channel depth (does not force BGR conversion).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # IMREAD_UNCHANGED correctly loads RGB, YCrCb, or Gray
+    image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+    
+    if image is None:
+        raise ValueError(f"Failed to decode image: {file_path}")
+    return image
 
 
-def save_frame(path: str, frame: NDArray):
-    Image.fromarray(frame).save(path)
+def add_wgn(image: np.ndarray, snr: float) -> np.ndarray:
+    """
+    Adds Additive White Gaussian Noise (WGN).
+    """
+    image_float = image.astype(np.float32)
+    
+    # Calculates signal power (image)
+    sig_power = np.mean(image_float ** 2)
+    
+    # Calculates noise power based on desired SNR (in dB)
+    a = -0.05 * snr
+    noise_power = np.sqrt(sig_power) * (10 ** a)
+    
+    # Generates noise
+    noise = noise_power * np.random.randn(*image_float.shape)
+    
+    noisy_image = image_float + noise
+    
+    # Ensures values stay between 0 and 255
+    return np.clip(noisy_image, 0, 255).astype(np.uint8)
 
 
-def preprocess_batch_frame(
-    b_frame: list,
-    output_dir: Path,
-    index: int,
-):
-    global detector
-
-    to_rgb = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-    for g, frame in enumerate(b_frame, index):
-        cropped_frame = crop_face(to_rgb(frame), detector)
-        if cropped_frame is None:
-            print(f"crop_face return is None on frame {g}")
-            continue
-        save_frame(f"{output_dir}/frame_{g + 1:04d}.jpg", cropped_frame)
-
-
-def extract_frames(
-    video_path: str,
-    output_dir: Path,
-    workers: int,
-) -> int | None:
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with ProcessPoolExecutor(max_workers=workers, initializer=init_worker) as executor:
-
-        video = cv2.VideoCapture(video_path)
-        if not video.isOpened():
-            print(f"Error: Could not open video file {video_path}")
-            exit()
-
-        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-        frames = list(video.read()[1] for _ in range(total_frames))
-        batch_size = total_frames // workers if total_frames > workers else 1
-        batches = [
-            [i, frames[i : i + batch_size]] for i in range(0, total_frames, batch_size)
-        ]
-
-        futures = [
-            executor.submit(
-                preprocess_batch_frame,
-                batch[1],
-                output_dir,
-                batch[0],
-            )
-            for batch in batches
-        ]
-        wait(futures)
-
-        extracted_frames_num = len(list(output_dir.glob("**/*.jpg")))
-
-    return extracted_frames_num
+def add_salt_and_pepper(image: np.ndarray, noise_ratio: float, salt_val=255, pepper_val=0) -> np.ndarray:
+    """
+    Adds Salt and Pepper (Impulsive) Noise.
+    CORRECTED: Uses 2D mask to apply across all channels automatically.
+    """
+    noisy_image = image.copy()
+    h, w = noisy_image.shape[:2]
+    
+    # Generates random 2D matrix
+    rng = np.random.rand(h, w)
+    
+    # Creates 2D boolean masks
+    salt_mask = rng < (noise_ratio / 2)
+    pepper_mask = (rng >= (noise_ratio / 2)) & (rng < noise_ratio)
+    
+    # We apply the 2D mask directly. 
+    # NumPy understands that if the image is 3D, it should apply the value to all 3 channels.
+    noisy_image[salt_mask] = salt_val
+    noisy_image[pepper_mask] = pepper_val
+    
+    return noisy_image
 
 
-def extract_audio_features(audio: NDArray[Any], **mfcc_kwargs) -> NDArray | None:
-
-    audio = audio - np.mean(audio)
-    audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
-    mfccs = torchaudio.compliance.kaldi.mfcc(waveform=audio_tensor, **mfcc_kwargs)
-
-    mean, std = torch.mean(
-        mfccs,
-        dim=0,
-        keepdim=True,
-    ), torch.std(
-        mfccs,
-        dim=0,
-        keepdim=True,
-    )
-    mfccs = (mfccs - mean) / (std + 1e-9)
-    to_rgb = mfccs.repeat(3, 1, 1).permute(1, 2, 0)
-    return to_rgb.numpy()
+def add_blur(image: np.ndarray, kernel_size: int) -> np.ndarray:
+    """
+    Applies simple Blur.
+    """
+    if kernel_size <= 0:
+        raise ValueError("The kernel_size must be greater than 0.")
+    return cv2.blur(image, (kernel_size, kernel_size))
 
 
-def save_audio_features(
-    audio_features: NDArray[Any],
-    output_dir: Path,
-    workers: int,
-):
+# ==========================================
+# 2. INTERNAL PROCESSING ENGINE
+# ==========================================
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _processar_diretorio(input_dir, output_dir_name, func_ruido, **kwargs):
+    """
+    Traverses the directory and applies noise, saving to a new folder.
+    """
+    if not os.path.exists(output_dir_name):
+        os.makedirs(output_dir_name)
+        print(f"📁 Creating directory: {output_dir_name}")
+    else:
+        print(f"⚠️  Directory already exists: {output_dir_name} (Files may be overwritten)")
 
-    nor_audio_features = (audio_features - np.min(audio_features)) / (
-        np.max(audio_features) - np.min(audio_features) + 1e-6
-    )
+    files_to_process = []
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                files_to_process.append(os.path.join(root, file))
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for i, frame in enumerate(nor_audio_features):
-            frame_array = frame.reshape(audio_features.shape[1], 1, 3)
-            frame_array = (frame_array * 255).astype(np.uint8)
-            executor.submit(
-                save_frame,
-                f"{output_dir}/frame_{i + 1:04d}.jpg",
-                frame_array,
-            )
-
-
-def extract_audio(
-    video: VideoClip, sr: int | None, channel: int = 0
-) -> NDArray[Any] | None:
-
-    audio_clip = video.audio
-
-    if audio_clip is None:
-        return None
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp_audio:
-
-        audio_clip.write_audiofile(tmp_audio.name, fps=sr, logger=None)
-        _, audio_array = wavfile.read(tmp_audio.name)
-        match channel:
-            case 0:
-                audio_array = audio_array.mean(axis=1)
-            case -1:
-                audio_array = audio_array[:, 0]
-
-            case 1:
-                audio_array = audio_array[:, 1]
-
-    return audio_array
-
-
-def cut_video(
-    video: VideoClip,
-    start: float | Tuple | str = 0.0,
-    end: float | Tuple | str | None = None,
-) -> VideoClip:
-    return video.subclipped(start, end)
-
-
-def remove_silency(video: VideoFileClip) -> VideoClip:
-
-    audio = video.audio
-    if audio is None:
-        print("Warning: video with no audio")
-        return video
-
-    sr = audio.fps
-    mono = audio.to_soundarray(fps=sr).mean(axis=1)
-    non_silent_intervals = split(mono, top_db=30)
-    clip_segments = []
-    for start, end in non_silent_intervals:
-        clip_segments.append(video.subclipped(start / sr, end / sr))
-    edited_video = concatenate_videoclips(
-        clip_segments,
-    )
-    return edited_video
-
-
-def preprocess_data(
-    index: int,
-    data_path: Path,
-    output_dir: Path,
-    duration: float,
-    workers: int,
-) -> None:
-
-    video_name_dir = data_path.stem
-    video_out_dir = output_dir / video_name_dir / "video_frames"
-    audio_spec_out_dir = output_dir / video_name_dir / "audio_spectrograms"
-
-    # --- Configuration based on the paper ---
-    MFCC_CONFIG = {
-        "sample_frequency": 16000,
-        "frame_length": 15.0,
-        "frame_shift": 4.0,
-        "num_ceps": 13,
-        "use_energy": False,
-        "dither": 0.0,
-        "window_type": "hanning",
-        "cepstral_lifter": 22,
-        "high_freq": -400,
-        "low_freq": 20,
-        "num_mel_bins": 40,
-    }
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp_file:
-        video = VideoFileClip(str(data_path))
-
-        if duration:
-            assert video.duration >= duration, "duration > video.duration"
-
-        print(f"\nVideo: {data_path.name}")
-        print(f"Video duration (Raw): {video.duration}s")
-
-        edited_video = remove_silency(video)
-        edited_video = cut_video(edited_video, end=duration)
-        edited_video.write_videofile(tmp_file.name, logger=None, threads=workers)
-        video.close()
-
-        clean_video = VideoFileClip(tmp_file.name)
-
-        print(f"Video duration (Edited): {clean_video.duration}s")
-
-        audio = extract_audio(clean_video, MFCC_CONFIG["sample_frequency"])
-        if audio is None:
-            print(f"No audio found in video: {data_path}")
-            return
-        extracted_features = extract_audio_features(audio, **MFCC_CONFIG)
-
-        if extracted_features is None:
-            print("Extract features is None")
-            return
-
-        audio_features = extracted_features
-        save_audio_features(audio_features, audio_spec_out_dir, workers)
-        frames_num = extract_frames(tmp_file.name, video_out_dir, workers)
-        if frames_num is None:
-            print("Extracted frames number is None")
-            return
-        print(f"Extracted frames: {frames_num}\n")
-        clean_video.close()
-        check_out_video(index, data_path, output_dir)
-
-
-def main(args):
-    start_index = 0
-    source_dir, output_dir, duration, workers, resume = (
-        Path(args.source_dir),
-        Path(args.output_dir),
-        args.duration,
-        args.workers_num,
-        args.resume,
-    )
-    if not workers:
-        workers = os.cpu_count() or 1
-    if not source_dir.is_dir() or not any(source_dir.iterdir()):
-        print(f"Error: Source directory not found or is empty at {source_dir}")
+    if not files_to_process:
+        print("❌ No valid images found in input.")
         return
 
-    video_files = list(source_dir.glob("**/*.mp4")) + list(source_dir.glob("**/*.mov"))
+    print(f"🚀 Processing {len(files_to_process)} images...")
+    
+    successes = 0
+    errors = 0
+    
+    for file_path in tqdm(files_to_process):
+        try:
+            img = load_image_to_ndarray(file_path)
+            img_processed = func_ruido(img, **kwargs)
+            
+            # Maintains subfolder structure
+            relative_path = os.path.relpath(file_path, input_dir)
+            final_path = os.path.join(output_dir_name, relative_path)
+            
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            cv2.imwrite(final_path, img_processed)
+            successes += 1
+            
+        except Exception as e:
+            errors += 1
+            # Print error only if critical, to avoid polluting terminal
+            print(f"\n❌ Error in {os.path.basename(file_path)}: {e}")
 
-    resume_file_path = output_dir.joinpath("resume.json")
-    if resume and resume_file_path.is_file():
-        print(f"Checking the last check point...\n")
-        with open(resume_file_path.as_posix()) as f:
-            json_file = json.load(f)
-            preprocessed_videos = json_file["preprocessed_videos"]
-            last_video_index = json_file["last_video_index"]
-            filtered_videos = [
-                video
-                for video in video_files
-                if video.name not in preprocessed_videos
-            ]
-
-            start_index = last_video_index + 1 if last_video_index else 0
-            video_files = filtered_videos
-            if len(video_files) == 0:
-                print("\nPre-processing complete")
-                return
-    else:
-        if resume:
-            print(
-                f"\nWarning: Resume is set to True, but resume.json file does not exists"
-            )
-        output_dir.mkdir(exist_ok=True)
-        with open(resume_file_path.as_posix(), "w") as f:
-            data = {"preprocessed_videos": [], "last_video_index": None}
-            json.dump(data, f, indent=4)
-
-    print(17 * "=")
-    print("Summary")
-    print(17 * "=")
-    print(f"Source dir: {source_dir.absolute().as_posix()}")
-    print(f"Output dir: {output_dir.absolute().as_posix()}")
-    print(f"Videos found: {len(video_files)}")
-    print(f"Workes used: {workers}\n")
-    print(f"Pre-processing started. This may take a long time.\n")
-    for i, video_path in tqdm(
-        enumerate(video_files, start_index), desc="Processing videos"
-    ):
-        preprocess_data(i, video_path, output_dir, duration, workers)
-    try:
-        shutil.copy(
-            source_dir.joinpath("metadata.json").as_posix(),
-            output_dir.as_posix(),
-        )
-    except FileNotFoundError:
-        print(f"Error: Source file metadata.json not found.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-    print("\nPre-processing complete")
-    print(f"\nDataset created at: {output_dir.absolute().as_posix()}")
+    print(f"🏁 Finished. Successes: {successes} | Failures: {errors}\n")
 
 
+# ==========================================
+# 3. WRAPPERS (Call Functions)
+# ==========================================
+
+def gerar_dataset_gaussiano(diretorio_entrada: str, snr: float):
+    clean_path = os.path.normpath(diretorio_entrada)
+    output_name = f"{os.path.basename(clean_path)}_WGN_{snr}dB"
+    print(f"--- Starting WGN (SNR={snr}) ---")
+    _processar_diretorio(diretorio_entrada, output_name, add_wgn, snr=snr)
+
+def gerar_dataset_sal_pimenta(diretorio_entrada: str, noise_ratio: float):
+    clean_path = os.path.normpath(diretorio_entrada)
+    pct = int(noise_ratio * 100)
+    output_name = f"{os.path.basename(clean_path)}_SP_{pct}pct"
+    print(f"--- Starting Salt & Pepper ({pct}%) ---")
+    _processar_diretorio(diretorio_entrada, output_name, add_salt_and_pepper, noise_ratio=noise_ratio)
+
+def gerar_dataset_blur(diretorio_entrada: str, kernel_size: int):
+    clean_path = os.path.normpath(diretorio_entrada)
+    output_name = f"{os.path.basename(clean_path)}_Blur_{kernel_size}px"
+    print(f"--- Starting Blur (Kernel={kernel_size}) ---")
+    _processar_diretorio(diretorio_entrada, output_name, add_blur, kernel_size=kernel_size)
+
+
+# ==========================================
+# 4. CLI (Command Line Interface)
+# ==========================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Pre-process videos for the AVoiD-DF model using MTCNN."
-    )
-    parser.add_argument(
-        "--source-dir",
-        type=str,
-        required=True,
-        help="Directory containing 'real' and 'fake' subfolders with videos.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        required=True,
-        help="Directory to save the processed dataset.",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=None,
-        help="Duration of the video",
-    )
-    parser.add_argument(
-        "--workers_num",
-        type=int,
-        default=None,
-        help="Number of used workers on preprocessing",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume the dataset preprocessing",
-    )
+    parser = argparse.ArgumentParser(description="Data Augmentation Tool.")
+    
+    parser.add_argument("-i", "--input", required=True, help="Input directory.")
+    parser.add_argument("-t", "--type", choices=["wgn", "sp", "blur", "all"], nargs='+', required=True, 
+                        help="Noise types (e.g., -t wgn sp blur).")
+    
+    # Default configurations
+    parser.add_argument("--snr", type=float, default=25.0, help="SNR (WGN). Default: 25.0")
+    parser.add_argument("--ratio", type=float, default=0.05, help="Ratio (SP). Default: 0.05")
+    parser.add_argument("--kernel", type=int, default=5, help="Kernel (Blur). Default: 5")
 
     args = parser.parse_args()
-    main(args)
+
+    # Prepare task list
+    if "all" in args.type:
+        types = ["wgn", "sp", "blur"]
+    else:
+        types = args.type
+    
+    # Remove duplicates and SORT to ensure execution order: Blur > SP > WGN
+    sorted_types = sorted(list(set(types)))
+
+    print(f"🔄 Processing queue: {sorted_types}\n")
+
+    for type_ in sorted_types:
+        if type_ == "wgn":
+            gerar_dataset_gaussiano(args.input, snr=args.snr)
+        elif type_ == "sp":
+            gerar_dataset_sal_pimenta(args.input, noise_ratio=args.ratio)
+        elif type_ == "blur":
+            gerar_dataset_blur(args.input, kernel_size=args.kernel)
+        
+    print("✅ All processing completed.")
