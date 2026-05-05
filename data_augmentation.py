@@ -27,16 +27,38 @@ import glob
 import argparse
 from tqdm import tqdm
 
-def add_gaussian_noise(images, sigma=25):
+def add_gaussian_noise(image, snr_db=15.0):
     """
-    Applies Gaussian noise to a batch of images.
-
-    :param images: NumPy array of shape (N, H, W, C) in uint8.
-    :param sigma: Standard deviation of the noise distribution.
-    :return: Augmented uint8 NumPy array.
+    Adiciona ruído Gaussiano baseado em um SNR fixo (em dB).
+    
+    :param image: Imagem original em uint8 (0-255).
+    :param snr_db: Relação Sinal-Ruído desejada em decibéis. 
+                   Valores típicos: 10 (muito ruído) a 30 (pouco ruído).
     """
-    gauss = np.random.normal(0, sigma, images.shape)
-    return np.clip(images.astype(np.float32) + gauss, 0, 255).astype(np.uint8)
+    # 1. Evitar overflow convertendo para float antes dos cálculos
+    image_float = image.astype(np.float32)
+    
+    # 2. Calcular a Potência do Sinal (Média dos quadrados dos pixels)
+    signal_power = np.mean(image_float ** 2)
+    
+    # Prevenção: Se a imagem for preta (potência 0), retornamos a própria imagem
+    if signal_power == 0:
+        return image.copy()
+        
+    # 3. Converter o SNR de decibéis (dB) para escala linear
+    snr_linear = 10 ** (snr_db / 10.0)
+    
+    # 4. Calcular a potência do ruído necessária
+    noise_power = signal_power / snr_linear
+    
+    # 5. O desvio padrão (sigma) é a raiz quadrada da potência do ruído
+    sigma = np.sqrt(noise_power)
+    
+    # 6. Gerar e adicionar o ruído
+    gauss = np.random.normal(0, sigma, image.shape)
+    noisy_image = np.clip(image_float + gauss, 0, 255).astype(np.uint8)
+    
+    return noisy_image
 
 def add_salt_and_pepper_noise(images, prob=0.04):
     """
