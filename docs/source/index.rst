@@ -7,3 +7,4 @@ Multimodal Pipeline Documentation
 
    face2
    data_augmentation
+   avaliacao
