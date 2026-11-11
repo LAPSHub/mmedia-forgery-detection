@@ -1,0 +1,17 @@
+# Bibliotecas base do projeto (Extração e Processamento)
+numpy
+opencv-python
+torch
+torchaudio
+mtcnn
+moviepy
+scipy
+tqdm
+
+# Bibliotecas para Avaliação e Métricas
+scikit-learn
+matplotlib
+
+# Dependências para Documentação (Sphinx)
+sphinx
+sphinx-rtd-theme
